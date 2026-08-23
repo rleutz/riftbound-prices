@@ -1,0 +1,131 @@
+name: Update Riftbound Prices
+
+on:
+  schedule:
+    # 21:00 UTC = 5:00 PM Eastern (accounts for DST; adjust to 22:00 in winter if desired)
+    - cron: '0 21 * * *'
+  workflow_dispatch:     # allows manual trigger from GitHub Actions tab
+
+permissions:
+  contents: write        # needed to commit the updated JSON
+  issues: write          # needed to open new-set alert issues
+
+jobs:
+  fetch-prices:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out the repo ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 3. Run the price fetch script ──────────────────────────────────────
+      - name: Fetch prices from TCGCSV
+        id: fetch
+        env:
+          OUTPUT_PATH: prices/riftbound_prices_updated.json
+        run: |
+          python scripts/fetch_prices.py
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+        # continue even if exit code is 1 (new sets detected)
+        continue-on-error: true
+
+      # ── 4. Capture new-set info for the issue body ─────────────────────────
+      - name: Extract new set info
+        id: new_sets
+        if: steps.fetch.outcome == 'failure'
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          with open("prices/riftbound_prices_updated.json") as f:
+              data = json.load(f)
+          new = data.get("new_sets", [])
+          if new:
+              lines = []
+              for s in new:
+                  lines.append(f"- **{s['abbreviation']}** — {s['name']} (groupId: {s['groupId']})")
+              body = "\n".join(lines)
+          else:
+              body = "_No details available._"
+          # Write to env file so next step can use it
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              # Multiline value needs special encoding
+              env.write(f"NEW_SET_BODY<<EOF\n{body}\nEOF\n")
+          PYEOF
+
+      # ── 5. Open a GitHub Issue if new sets were detected ───────────────────
+      - name: Open new-set alert issue
+        if: steps.fetch.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = process.env.NEW_SET_BODY || '_Details not available._';
+            const issueBody = `## 🆕 New Riftbound Set(s) Detected
+
+            The daily price fetch found one or more sets that aren't yet in the tracker:
+
+            ${body}
+
+            ---
+
+            ## What you need to do
+
+            The price data for these cards is **already being fetched automatically** — prices will appear in the JSON file. However, the tracker's card grid won't show the new cards until you add them to the card database.
+
+            ### Steps to add the new set to the tracker:
+
+            1. **Get the card list** — go to \`https://tcgcsv.com/tcgplayer/89/groups\` and find the new set's \`groupId\`. Then visit \`https://tcgcsv.com/tcgplayer/89/{groupId}/products\` to see all its cards.
+
+            2. **Update the tracker** — open a new conversation in the Riftbound Claude project and say:
+               > "A new Riftbound set has been detected: [SET NAME] ([ABBREVIATION]). Please add it to the tracker with [N] cards."
+               
+               Claude will update the tracker artifact to include the new set tab, cards, and completion tracking.
+
+            3. **Update \`KNOWN_SETS\`** in \`scripts/fetch_prices.py\` — add the new abbreviation to either \`MAIN_SETS\` or \`PROMO_SETS\` so this issue doesn't re-trigger every day:
+               \`\`\`python
+               # In MAIN_SETS (for full booster sets):
+               MAIN_SETS = {"OGN", "OGS", "SFD", "UNL", "VEN", "NEW_ABBR"}
+               
+               # OR in PROMO_SETS (for promo/supplemental sets):
+               PROMO_SETS = {"JDG", "OPP", "PR", "RWB", "SGN", "RAD", "LGC", "NEW_ABBR"}
+               \`\`\`
+               Commit that change to close this issue and stop the daily alerts.
+
+            4. **Close this issue** once the tracker is updated.
+
+            ---
+            _This issue was opened automatically by the daily price update workflow._`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🆕 New Riftbound set detected — tracker update needed',
+              body: issueBody,
+              labels: ['new-set', 'tracker-update-needed'],
+            });
+
+      # ── 6. Commit updated prices back to the repo ──────────────────────────
+      - name: Commit updated prices
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add prices/riftbound_prices_updated.json
+          # Only commit if something actually changed
+          if git diff --staged --quiet; then
+            echo "No price changes detected — nothing to commit."
+          else
+            PRICE_COUNT=$(python3 -c "
+          import json
+          with open('prices/riftbound_prices_updated.json') as f:
+              d = json.load(f)
+          print(len(d['prices']))
+          ")
+            git commit -m "chore: update prices — ${PRICE_COUNT} cards ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
